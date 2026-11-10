@@ -1,0 +1,13 @@
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP", "S"]
+
+[lint.per-file-ignores]
+# Tests assert, and start subprocesses with fixed arguments on purpose.
+"**/tests/**" = ["S101", "S603", "S607"]
+
+[lint.isort]
+# Each tool and scripts/ is its own import root; their local modules are first-party.
+known-first-party = ["app", "invoice", "changed_tools"]

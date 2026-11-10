@@ -1,0 +1,142 @@
+name: CI
+
+# Runs on every pull request into dev or main and on every push to dev.
+# Pushes to main are tested by the Deploy workflow, which calls this file
+# before it builds anything, so the commit that ships is the commit that passed.
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Detect changed tools
+    runs-on: ubuntu-latest
+    outputs:
+      tools: ${{ steps.detect.outputs.tools }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Which tools does this change touch?
+        id: detect
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          tools=$(python scripts/changed_tools.py "$BASE" "$HEAD")
+          echo "tools=$tools" >> "$GITHUB_OUTPUT"
+          echo "### Tools under test: \`$tools\`" >> "$GITHUB_STEP_SUMMARY"
+
+  lint:
+    name: Lint and format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --disable-pip-version-check ruff==0.8.4
+      - name: ruff check
+        run: ruff check --output-format=github .
+      - name: ruff format
+        run: ruff format --check .
+      - name: shellcheck
+        run: shellcheck scripts/*.sh scripts/ci/*.sh
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.12 -color
+
+  pipeline:
+    name: Pipeline scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --disable-pip-version-check -r scripts/requirements-dev.txt
+      - name: Test change detection, release build and deploy (incl. a real rollback)
+        run: python -m pytest scripts/tests
+
+  test:
+    name: Test ${{ matrix.tool }}
+    needs: changes
+    if: needs.changes.outputs.tools != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: ${{ fromJSON(needs.changes.outputs.tools) }}
+    defaults:
+      run:
+        working-directory: tools/${{ matrix.tool }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/${{ matrix.tool }}/requirements*.txt
+      - name: Install into the tool's own virtualenv, like on the server
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -r requirements-dev.txt
+      - name: Run tests with a 90% coverage floor
+        run: >-
+          .venv/bin/pytest --junitxml=junit.xml
+          --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
+      - name: Keep the test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.tool }}
+          path: tools/${{ matrix.tool }}/junit.xml
+          if-no-files-found: ignore
+
+  promotion:
+    name: Only dev is promoted to main
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the source branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          if [ "$HEAD_REF" != "dev" ] || [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+            echo "::error::Pull requests into main must come from dev in this repository (got $HEAD_REPO:$HEAD_REF)."
+            exit 1
+          fi
+
+  # The one status check that branch protection requires. The set of matrix
+  # jobs changes with every change set, so protection can't list them by name.
+  gate:
+    name: CI gate
+    if: always()
+    needs: [changes, lint, pipeline, test, promotion]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job passed or was rightly skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) echo "::error::A required job ended with '$result'."; exit 1 ;;
+            esac
+          done

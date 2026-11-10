@@ -1,0 +1,173 @@
+name: Deploy
+
+# main is what runs in production. Every push to main is tested again on
+# exactly that commit, packaged once, and deployed tool by tool with a health
+# check and automatic rollback.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tool:
+        description: Which tool to deploy
+        type: choice
+        options: [all, status-board, invoice-check]
+        default: all
+
+permissions:
+  contents: read
+
+# Never two deploys at once, and never cancel one halfway.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  plan:
+    name: Plan the release
+    needs: ci
+    runs-on: ubuntu-latest
+    outputs:
+      tools: ${{ steps.pick.outputs.tools }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Pick the tools to ship
+        id: pick
+        env:
+          CHOICE: ${{ inputs.tool }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case "$CHOICE" in
+            "") tools=$(python scripts/changed_tools.py "$BEFORE" "$GITHUB_SHA") ;;
+            all) tools=$(python scripts/changed_tools.py --all) ;;
+            *) tools=$(python -c 'import json, sys; print(json.dumps([sys.argv[1]]))' "$CHOICE") ;;
+          esac
+          echo "tools=$tools" >> "$GITHUB_OUTPUT"
+          echo "### Release plan: \`$tools\`" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Build ${{ matrix.tool }}
+    needs: plan
+    if: needs.plan.outputs.tools != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tool: ${{ fromJSON(needs.plan.outputs.tools) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package the release, stamped with this commit
+        id: build
+        env:
+          TOOL: ${{ matrix.tool }}
+        run: echo "artifact=$(scripts/build_release.sh "$TOOL" "$GITHUB_SHA" dist)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.tool }}
+          path: ${{ steps.build.outputs.artifact }}
+          retention-days: 30
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy ${{ matrix.tool }}
+    needs: [plan, release]
+    if: needs.plan.outputs.tools != '[]'
+    runs-on: ubuntu-latest
+    # The place for an approval gate: add required reviewers to this environment.
+    environment: production
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        tool: ${{ fromJSON(needs.plan.outputs.tools) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ matrix.tool }}
+          path: dist
+
+      # On a real server RESTART_CMD is `sudo systemctl restart tool-$TOOL` and
+      # this job runs on a self-hosted runner inside the network. Here the
+      # GitHub-hosted runner plays the server.
+      - name: Deploy, verify the version that serves, roll back on failure
+        env:
+          TOOL: ${{ matrix.tool }}
+          DEPLOY_ROOT: ${{ runner.temp }}/opt
+          HEALTH_URL: http://127.0.0.1:8080/healthz
+          RESTART_CMD: scripts/ci/runner-service.sh restart "$TOOL" 8080
+        run: scripts/deploy.sh "$TOOL" dist/"$TOOL"-*.tar.gz
+
+      - name: Smoke test
+        run: |
+          curl -fsS http://127.0.0.1:8080/healthz | tee healthz.json
+          echo
+          python - <<'PY'
+          import json, os
+          body = json.load(open("healthz.json"))
+          assert body["status"] == "ok", body
+          assert body["version"] == os.environ["GITHUB_SHA"][:12], body
+          print("serving", body["version"])
+          PY
+
+      # Demo only: on the stand-in server, prove that a broken build is rolled
+      # back by itself. scripts/tests/test_deploy.py proves the same on every CI run.
+      - name: Rollback drill
+        env:
+          TOOL: ${{ matrix.tool }}
+          DEPLOY_ROOT: ${{ runner.temp }}/opt
+          HEALTH_URL: http://127.0.0.1:8080/healthz
+          RESTART_CMD: scripts/ci/runner-service.sh restart "$TOOL" 8080
+          HEALTH_RETRIES: "15"
+          DRILL: ${{ runner.temp }}/drill
+        run: |
+          mkdir -p "$DRILL/build"
+          tar -xzf dist/"$TOOL"-*.tar.gz -C "$DRILL/build"
+          echo 'raise RuntimeError("rollback drill: this build is broken")' >> "$DRILL/build/app.py"
+          echo "drill-${GITHUB_RUN_ID}" > "$DRILL/build/VERSION"
+          tar -czf "$DRILL/broken.tar.gz" -C "$DRILL/build" .
+          set +e
+          scripts/deploy.sh "$TOOL" "$DRILL/broken.tar.gz"
+          code=$?
+          set -e
+          if [ "$code" != 1 ]; then
+            echo "::error::Expected an automatic rollback (exit 1), got exit $code."
+            exit 1
+          fi
+          serving=$(curl -fsS "$HEALTH_URL" | python -c 'import json, sys; print(json.load(sys.stdin)["version"])')
+          test "$serving" = "${GITHUB_SHA:0:12}"
+          echo "Broken build was rolled back; still serving $serving."
+
+      - name: Deployment log
+        if: always()
+        env:
+          TOOL: ${{ matrix.tool }}
+          LOG: ${{ runner.temp }}/opt/${{ matrix.tool }}/deploys.log
+        run: |
+          {
+            echo "### $TOOL"
+            echo
+            echo "| when (UTC) | version | outcome |"
+            echo "|---|---|---|"
+            if [ -f "$LOG" ]; then
+              awk -F'\t' '{ printf "| %s | `%s` | %s |\n", $1, $2, $3 }' "$LOG"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop the demo service
+        if: always()
+        env:
+          TOOL: ${{ matrix.tool }}
+          DEPLOY_ROOT: ${{ runner.temp }}/opt
+        run: scripts/ci/runner-service.sh stop "$TOOL"
